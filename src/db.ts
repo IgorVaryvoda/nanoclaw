@@ -164,6 +164,22 @@ export function storeMessage(msg: proto.IWebMessageInfo, chatJid: string, isFrom
     .run(msgId, chatJid, sender, senderName, content, timestamp, isFromMe ? 1 : 0);
 }
 
+/**
+ * Store a message from any source (Telegram, etc.)
+ */
+export function storeGenericMessage(
+  msgId: string,
+  chatJid: string,
+  sender: string,
+  senderName: string,
+  content: string,
+  isFromMe: boolean
+): void {
+  const timestamp = new Date().toISOString();
+  db.prepare(`INSERT OR REPLACE INTO messages (id, chat_jid, sender, sender_name, content, timestamp, is_from_me) VALUES (?, ?, ?, ?, ?, ?, ?)`)
+    .run(msgId, chatJid, sender, senderName, content, timestamp, isFromMe ? 1 : 0);
+}
+
 export function getNewMessages(jids: string[], lastTimestamp: string, botPrefix: string): { messages: NewMessage[]; newTimestamp: string } {
   if (jids.length === 0) return { messages: [], newTimestamp: lastTimestamp };
 

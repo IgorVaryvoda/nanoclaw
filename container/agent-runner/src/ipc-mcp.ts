@@ -67,6 +67,44 @@ export function createIpcMcp(ctx: IpcMcpContext) {
       ),
 
       tool(
+        'send_media',
+        'Send a media file (video, audio, image, document) to the current WhatsApp chat. The file must exist in the workspace.',
+        {
+          file_path: z.string().describe('Path to the media file in the workspace (e.g., /workspace/group/video.mp4)'),
+          caption: z.string().optional().describe('Optional caption for the media'),
+          media_type: z.enum(['video', 'audio', 'image', 'document']).describe('Type of media being sent')
+        },
+        async (args) => {
+          // Verify file exists
+          if (!fs.existsSync(args.file_path)) {
+            return {
+              content: [{ type: 'text', text: `File not found: ${args.file_path}` }],
+              isError: true
+            };
+          }
+
+          const data = {
+            type: 'media',
+            chatJid,
+            filePath: args.file_path,
+            caption: args.caption,
+            mediaType: args.media_type,
+            groupFolder,
+            timestamp: new Date().toISOString()
+          };
+
+          const filename = writeIpcFile(MESSAGES_DIR, data);
+
+          return {
+            content: [{
+              type: 'text',
+              text: `Media queued for delivery (${filename})`
+            }]
+          };
+        }
+      ),
+
+      tool(
         'schedule_task',
         `Schedule a recurring or one-time task. The task will run as a full agent with access to all tools.
 

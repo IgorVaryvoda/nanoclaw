@@ -99,6 +99,43 @@ curl -s "https://query1.finance.yahoo.com/v8/finance/chart/TSLA?interval=1d&rang
 
 Common tickers: AAPL, GOOGL, MSFT, TSLA, NVDA, META, AMZN, SPY (S&P 500), QQQ (Nasdaq)
 
+## Video Downloads (viddl.me)
+
+API base: `https://viddl.me`
+API key: `f82f55a0276da12f571e0ae68106a1de0a8eb4877f19639ae6c5853b741c3d6e`
+
+Supports: YouTube, Twitter/X, Instagram, TikTok, Threads
+
+```bash
+# Get video info
+curl -s -X POST "https://viddl.me/api/info" \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: f82f55a0276da12f571e0ae68106a1de0a8eb4877f19639ae6c5853b741c3d6e" \
+  -d '{"url": "VIDEO_URL"}'
+
+# Download video (returns binary MP4)
+curl -s -X POST "https://viddl.me/api/download" \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: f82f55a0276da12f571e0ae68106a1de0a8eb4877f19639ae6c5853b741c3d6e" \
+  -d '{"url": "VIDEO_URL", "format": "best"}' \
+  -o video.mp4
+
+# Extract audio only (MP3)
+curl -s -X POST "https://viddl.me/api/audio" \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: f82f55a0276da12f571e0ae68106a1de0a8eb4877f19639ae6c5853b741c3d6e" \
+  -d '{"url": "VIDEO_URL", "audio_format": "mp3"}' \
+  -o audio.mp3
+```
+
+For multi-video posts (Instagram carousels), add `"video_index": N` to select which video.
+
+Rate limits: 3 req/min, 2 concurrent downloads.
+
+**To send downloaded media back to WhatsApp:**
+1. Download to workspace: `curl ... -o /workspace/group/video.mp4`
+2. Send via IPC: `mcp__nanoclaw__send_media` with file_path, media_type (video/audio/image/document), and optional caption
+
 ## Weather
 
 Default location: Herceg Novi, Montenegro (42.45°N, 18.54°E)

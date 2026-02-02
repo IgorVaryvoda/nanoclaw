@@ -6,6 +6,8 @@ import makeWASocket, {
   downloadMediaMessage,
   proto
 } from '@whiskeysockets/baileys';
+import { Telegraf, Context } from 'telegraf';
+import { message } from 'telegraf/filters';
 import Groq from 'groq-sdk';
 import pino from 'pino';
 import { exec, execSync } from 'child_process';
@@ -23,7 +25,7 @@ import {
   TIMEZONE
 } from './config.js';
 import { RegisteredGroup, Session, NewMessage } from './types.js';
-import { initDatabase, storeMessage, storeChatMetadata, getNewMessages, getMessagesSince, getAllTasks, getTaskById, updateChatName, getAllChats, getLastGroupSync, setLastGroupSync } from './db.js';
+import { initDatabase, storeMessage, storeGenericMessage, storeChatMetadata, getNewMessages, getMessagesSince, getAllTasks, getTaskById, updateChatName, getAllChats, getLastGroupSync, setLastGroupSync } from './db.js';
 import { startSchedulerLoop } from './task-scheduler.js';
 import { runContainerAgent, writeTasksSnapshot, writeGroupsSnapshot, AvailableGroup } from './container-runner.js';
 import { loadJson, saveJson } from './utils.js';
@@ -34,6 +36,16 @@ const logger = pino({
   level: process.env.LOG_LEVEL || 'info',
   transport: { target: 'pino-pretty', options: { colorize: true } }
 });
+
+// Telegram bot
+const telegramBot = process.env.TELEGRAM_BOT_TOKEN
+  ? new Telegraf(process.env.TELEGRAM_BOT_TOKEN)
+  : null;
+
+// Track which JID should respond via Telegram (for bridged mode)
+// When a Telegram message comes in, we set jid -> telegramChatId
+// After responding, we clear it so next WhatsApp message goes to WhatsApp
+const telegramBridgedChats: Map<string, number> = new Map();
 
 // Groq client for voice transcription
 const groq = process.env.GROQ_API_KEY ? new Groq({ apiKey: process.env.GROQ_API_KEY }) : null;
@@ -242,12 +254,126 @@ async function runAgent(group: RegisteredGroup, prompt: string, chatJid: string)
 }
 
 async function sendMessage(jid: string, text: string): Promise<void> {
+  // Check if this JID has a Telegram response channel
+  const telegramChatId = telegramBridgedChats.get(jid);
+  if (telegramChatId && telegramBot) {
+    try {
+      await telegramBot.telegram.sendMessage(telegramChatId, text);
+      logger.info({ telegramChatId, length: text.length }, 'Telegram message sent');
+      return;
+    } catch (err) {
+      logger.error({ telegramChatId, err }, 'Failed to send Telegram message, falling back to WhatsApp');
+    }
+  }
+
   try {
     await sock.sendMessage(jid, { text });
-    logger.info({ jid, length: text.length }, 'Message sent');
+    logger.info({ jid, length: text.length }, 'WhatsApp message sent');
   } catch (err) {
     logger.error({ jid, err }, 'Failed to send message');
   }
+}
+
+async function sendTelegramMessage(chatId: number, text: string): Promise<void> {
+  if (!telegramBot) return;
+  try {
+    await telegramBot.telegram.sendMessage(chatId, text);
+    logger.info({ chatId, length: text.length }, 'Telegram message sent');
+  } catch (err) {
+    logger.error({ chatId, err }, 'Failed to send Telegram message');
+  }
+}
+
+async function sendTelegramMedia(chatId: number, filePath: string, mediaType: string, caption?: string): Promise<void> {
+  if (!telegramBot) return;
+  try {
+    const source = { source: filePath };
+    switch (mediaType) {
+      case 'video':
+        await telegramBot.telegram.sendVideo(chatId, source, { caption });
+        break;
+      case 'audio':
+        await telegramBot.telegram.sendAudio(chatId, source, { caption });
+        break;
+      case 'image':
+        await telegramBot.telegram.sendPhoto(chatId, source, { caption });
+        break;
+      default:
+        await telegramBot.telegram.sendDocument(chatId, source, { caption });
+    }
+    logger.info({ chatId, mediaType }, 'Telegram media sent');
+  } catch (err) {
+    logger.error({ chatId, filePath, err }, 'Failed to send Telegram media');
+  }
+}
+
+async function sendMedia(jid: string, filePath: string, mediaType: string, caption?: string): Promise<void> {
+  try {
+    const buffer = fs.readFileSync(filePath);
+    const filename = path.basename(filePath);
+    const mimetype = getMimeType(filePath, mediaType);
+
+    switch (mediaType) {
+      case 'video':
+        await sock.sendMessage(jid, { video: buffer, caption, mimetype, fileName: filename });
+        break;
+      case 'audio':
+        await sock.sendMessage(jid, { audio: buffer, mimetype, fileName: filename });
+        break;
+      case 'image':
+        await sock.sendMessage(jid, { image: buffer, caption, mimetype, fileName: filename });
+        break;
+      case 'document':
+      default:
+        await sock.sendMessage(jid, { document: buffer, caption, mimetype, fileName: filename });
+        break;
+    }
+
+    logger.info({ jid, mediaType, filename }, 'Media sent');
+  } catch (err) {
+    logger.error({ jid, filePath, err }, 'Failed to send media');
+  }
+}
+
+function translateContainerPath(containerPath: string, groupFolder: string): string {
+  // Translate container paths to host paths
+  // /workspace/group/... -> groups/{groupFolder}/...
+  // /workspace/project/... -> {projectRoot}/...
+  // /workspace/extra/... -> from additional mounts (not supported yet)
+
+  const projectRoot = process.cwd();
+
+  if (containerPath.startsWith('/workspace/group/')) {
+    return path.join(projectRoot, 'groups', groupFolder, containerPath.slice('/workspace/group/'.length));
+  } else if (containerPath.startsWith('/workspace/project/')) {
+    return path.join(projectRoot, containerPath.slice('/workspace/project/'.length));
+  }
+
+  // If no translation needed, return as-is (might be an absolute host path)
+  return containerPath;
+}
+
+function getMimeType(filePath: string, mediaType: string): string {
+  const ext = path.extname(filePath).toLowerCase();
+  const mimeTypes: Record<string, string> = {
+    '.mp4': 'video/mp4',
+    '.webm': 'video/webm',
+    '.mov': 'video/quicktime',
+    '.avi': 'video/x-msvideo',
+    '.mp3': 'audio/mpeg',
+    '.ogg': 'audio/ogg',
+    '.wav': 'audio/wav',
+    '.m4a': 'audio/mp4',
+    '.jpg': 'image/jpeg',
+    '.jpeg': 'image/jpeg',
+    '.png': 'image/png',
+    '.gif': 'image/gif',
+    '.webp': 'image/webp',
+    '.pdf': 'application/pdf',
+    '.doc': 'application/msword',
+    '.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+  };
+  return mimeTypes[ext] || (mediaType === 'video' ? 'video/mp4' : mediaType === 'audio' ? 'audio/mpeg' : 'application/octet-stream');
 }
 
 function startIpcWatcher(): void {
@@ -281,14 +407,25 @@ function startIpcWatcher(): void {
             const filePath = path.join(messagesDir, file);
             try {
               const data = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
+              // Authorization: verify this group can send to this chatJid
+              const targetGroup = registeredGroups[data.chatJid];
+              const isAuthorized = isMain || (targetGroup && targetGroup.folder === sourceGroup);
+
               if (data.type === 'message' && data.chatJid && data.text) {
-                // Authorization: verify this group can send to this chatJid
-                const targetGroup = registeredGroups[data.chatJid];
-                if (isMain || (targetGroup && targetGroup.folder === sourceGroup)) {
+                if (isAuthorized) {
                   await sendMessage(data.chatJid, `${ASSISTANT_NAME}: ${data.text}`);
                   logger.info({ chatJid: data.chatJid, sourceGroup }, 'IPC message sent');
                 } else {
                   logger.warn({ chatJid: data.chatJid, sourceGroup }, 'Unauthorized IPC message attempt blocked');
+                }
+              } else if (data.type === 'media' && data.chatJid && data.filePath && data.mediaType) {
+                if (isAuthorized) {
+                  // Translate container path to host path
+                  const hostPath = translateContainerPath(data.filePath, data.groupFolder || sourceGroup);
+                  await sendMedia(data.chatJid, hostPath, data.mediaType, data.caption);
+                  logger.info({ chatJid: data.chatJid, sourceGroup, mediaType: data.mediaType, hostPath }, 'IPC media sent');
+                } else {
+                  logger.warn({ chatJid: data.chatJid, sourceGroup }, 'Unauthorized IPC media attempt blocked');
                 }
               }
               fs.unlinkSync(filePath);
@@ -665,11 +802,105 @@ function ensureContainerSystemRunning(): void {
   }
 }
 
+async function connectTelegram(): Promise<void> {
+  if (!telegramBot) {
+    logger.info('Telegram bot not configured (TELEGRAM_BOT_TOKEN not set)');
+    return;
+  }
+
+  // Get the main group JID for bridging
+  const mainJid = Object.entries(registeredGroups).find(([_, g]) => g.folder === MAIN_GROUP_FOLDER)?.[0];
+  if (!mainJid) {
+    logger.warn('No main group registered, Telegram messages will not be processed');
+    return;
+  }
+
+  // Handle text messages
+  telegramBot.on(message('text'), async (ctx) => {
+    const text = ctx.message.text;
+    const chatId = ctx.message.chat.id;
+    const userId = ctx.message.from?.id || chatId;
+    const userName = ctx.message.from?.first_name || ctx.message.from?.username || 'Telegram User';
+    const msgId = `tg-${ctx.message.message_id}`;
+
+    // Check for trigger pattern (or if from private chat, always respond)
+    const isPrivateChat = ctx.message.chat.type === 'private';
+    if (!isPrivateChat && !TRIGGER_PATTERN.test(text)) {
+      return; // Ignore messages without trigger in group chats
+    }
+
+    logger.info({ chatId, userName, text: text.slice(0, 50) }, 'Telegram message received');
+
+    // Store message with main JID for bridging
+    storeGenericMessage(msgId, mainJid, `telegram:${userId}`, userName, text, false);
+    storeChatMetadata(mainJid, new Date().toISOString());
+
+    // Set response channel to Telegram for this interaction
+    telegramBridgedChats.set(mainJid, chatId);
+
+    // Clear the bridge after a timeout (so WhatsApp messages go back to WhatsApp)
+    setTimeout(() => {
+      if (telegramBridgedChats.get(mainJid) === chatId) {
+        telegramBridgedChats.delete(mainJid);
+      }
+    }, 60000); // 60 second window
+  });
+
+  // Handle voice messages
+  telegramBot.on(message('voice'), async (ctx) => {
+    const chatId = ctx.message.chat.id;
+    const userId = ctx.message.from?.id || chatId;
+    const userName = ctx.message.from?.first_name || ctx.message.from?.username || 'Telegram User';
+    const msgId = `tg-${ctx.message.message_id}`;
+
+    logger.info({ chatId, userName }, 'Telegram voice message received');
+
+    try {
+      // Download voice file
+      const fileLink = await ctx.telegram.getFileLink(ctx.message.voice.file_id);
+      const response = await fetch(fileLink.href);
+      const buffer = Buffer.from(await response.arrayBuffer());
+
+      // Transcribe
+      const transcribed = await transcribeAudio(buffer);
+      if (!transcribed) {
+        await ctx.reply('Could not transcribe voice message');
+        return;
+      }
+
+      const text = `[Voice message]: ${transcribed}`;
+
+      // Store and process like text
+      storeGenericMessage(msgId, mainJid, `telegram:${userId}`, userName, text, false);
+      storeChatMetadata(mainJid, new Date().toISOString());
+
+      telegramBridgedChats.set(mainJid, chatId);
+      setTimeout(() => {
+        if (telegramBridgedChats.get(mainJid) === chatId) {
+          telegramBridgedChats.delete(mainJid);
+        }
+      }, 60000);
+    } catch (err) {
+      logger.error({ err }, 'Failed to process Telegram voice message');
+      await ctx.reply('Error processing voice message');
+    }
+  });
+
+  // Launch bot
+  telegramBot.launch();
+  logger.info('Telegram bot connected');
+
+  // Graceful shutdown
+  process.once('SIGINT', () => telegramBot.stop('SIGINT'));
+  process.once('SIGTERM', () => telegramBot.stop('SIGTERM'));
+}
+
 async function main(): Promise<void> {
   ensureContainerSystemRunning();
   initDatabase();
   logger.info('Database initialized');
   loadState();
+  await connectTelegram();
   await connectWhatsApp();
 }
 
