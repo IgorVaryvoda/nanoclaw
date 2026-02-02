@@ -47,6 +47,76 @@ Read the CLAUDE.md files in each folder for role-specific context and workflows.
 - Team: Gavriel (founder, sales & client work), Lazer (founder, dealflow), Ali (PM)
 - Obsidian-based workflow with Kanban boards (PIPELINE.md, PORTFOLIO.md)
 
+## Plausible Analytics (self-hosted)
+
+API base: `https://stats.varyvoda.com`
+API key: `dgfgIvrXRPukYFI9WP6e9QnUSEvn0v426VpsjKD3bZekgABR4uc1gmKPJiKMx2CG`
+
+Sites: earthroulette.com, varyvoda.com, travelbot.me, budjet.app, lowtax.guide, experts.sirv.com
+
+```bash
+# Realtime visitors
+curl -s "https://stats.varyvoda.com/api/v1/stats/realtime/visitors?site_id=SITE" \
+  -H "Authorization: Bearer dgfgIvrXRPukYFI9WP6e9QnUSEvn0v426VpsjKD3bZekgABR4uc1gmKPJiKMx2CG"
+
+# Aggregate stats (today, 7d, 30d, month, 6mo, 12mo, custom)
+curl -s "https://stats.varyvoda.com/api/v1/stats/aggregate?site_id=SITE&period=30d&metrics=visitors,pageviews,bounce_rate,visit_duration" \
+  -H "Authorization: Bearer dgfgIvrXRPukYFI9WP6e9QnUSEvn0v426VpsjKD3bZekgABR4uc1gmKPJiKMx2CG"
+
+# Top pages
+curl -s "https://stats.varyvoda.com/api/v1/stats/breakdown?site_id=SITE&period=30d&property=event:page&limit=10" \
+  -H "Authorization: Bearer dgfgIvrXRPukYFI9WP6e9QnUSEvn0v426VpsjKD3bZekgABR4uc1gmKPJiKMx2CG"
+
+# Traffic sources
+curl -s "https://stats.varyvoda.com/api/v1/stats/breakdown?site_id=SITE&period=30d&property=visit:source&limit=10" \
+  -H "Authorization: Bearer dgfgIvrXRPukYFI9WP6e9QnUSEvn0v426VpsjKD3bZekgABR4uc1gmKPJiKMx2CG"
+```
+
+Replace SITE with the domain. Metrics available: visitors, visits, pageviews, views_per_visit, bounce_rate, visit_duration, events.
+
+## Stocks & Crypto
+
+**Crypto (CoinGecko, free, no key):**
+```bash
+# Price of specific coins
+curl -s "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin,ethereum,solana&vs_currencies=usd&include_24hr_change=true"
+
+# Search for coin ID
+curl -s "https://api.coingecko.com/api/v3/search?query=COINNAME"
+
+# Top 10 by market cap
+curl -s "https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=market_cap_desc&per_page=10"
+```
+
+**Stocks (Yahoo Finance):**
+```bash
+# Stock quote
+curl -s "https://query1.finance.yahoo.com/v8/finance/chart/AAPL?interval=1d&range=1d" | jq '.chart.result[0].meta | {symbol, regularMarketPrice, previousClose}'
+
+# Multiple stocks
+curl -s "https://query1.finance.yahoo.com/v8/finance/chart/TSLA?interval=1d&range=5d"
+```
+
+Common tickers: AAPL, GOOGL, MSFT, TSLA, NVDA, META, AMZN, SPY (S&P 500), QQQ (Nasdaq)
+
+## Weather
+
+Default location: Herceg Novi, Montenegro (42.45°N, 18.54°E)
+
+Use Open-Meteo API (free, no key needed):
+
+```bash
+# Current weather + 7-day forecast
+curl -s "https://api.open-meteo.com/v1/forecast?latitude=42.45&longitude=18.54&current=temperature_2m,weather_code,wind_speed_10m&daily=weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max&timezone=Europe/Podgorica"
+```
+
+Weather codes: 0=Clear, 1-3=Partly cloudy, 45-48=Fog, 51-55=Drizzle, 61-65=Rain, 71-75=Snow, 80-82=Showers, 95-99=Thunderstorm
+
+For other locations, use geocoding first:
+```bash
+curl -s "https://geocoding-api.open-meteo.com/v1/search?name=CityName&count=1"
+```
+
 ## WhatsApp Formatting
 
 Do NOT use markdown headings (##) in WhatsApp messages. Only use:

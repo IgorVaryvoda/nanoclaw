@@ -2,8 +2,11 @@ import makeWASocket, {
   useMultiFileAuthState,
   DisconnectReason,
   makeCacheableSignalKeyStore,
-  WASocket
+  WASocket,
+  downloadMediaMessage,
+  proto
 } from '@whiskeysockets/baileys';
+import Groq from 'groq-sdk';
 import pino from 'pino';
 import { exec, execSync } from 'child_process';
 import fs from 'fs';
@@ -31,6 +34,31 @@ const logger = pino({
   level: process.env.LOG_LEVEL || 'info',
   transport: { target: 'pino-pretty', options: { colorize: true } }
 });
+
+// Groq client for voice transcription
+const groq = process.env.GROQ_API_KEY ? new Groq({ apiKey: process.env.GROQ_API_KEY }) : null;
+
+async function transcribeAudio(buffer: Buffer): Promise<string | null> {
+  if (!groq) {
+    logger.warn('GROQ_API_KEY not set, cannot transcribe audio');
+    return null;
+  }
+  try {
+    // Create a File object from the buffer for the Groq API
+    const file = new File([buffer], 'audio.ogg', { type: 'audio/ogg' });
+    const transcription = await groq.audio.transcriptions.create({
+      file,
+      model: 'whisper-large-v3-turbo',
+      temperature: 0,
+      response_format: 'json'
+    });
+    logger.info({ length: transcription.text.length }, 'Audio transcribed');
+    return transcription.text;
+  } catch (err) {
+    logger.error({ err }, 'Failed to transcribe audio');
+    return null;
+  }
+}
 
 let sock: WASocket;
 let lastTimestamp = '';
@@ -528,21 +556,40 @@ async function connectWhatsApp(): Promise<void> {
   sock.ev.on('creds.update', saveCreds);
 
   sock.ev.on('messages.upsert', ({ messages }) => {
-    for (const msg of messages) {
-      if (!msg.message) continue;
-      const chatJid = msg.key.remoteJid;
-      if (!chatJid || chatJid === 'status@broadcast') continue;
+    (async () => {
+      for (const msg of messages) {
+        if (!msg.message) continue;
+        const chatJid = msg.key.remoteJid;
+        if (!chatJid || chatJid === 'status@broadcast') continue;
 
-      const timestamp = new Date(Number(msg.messageTimestamp) * 1000).toISOString();
+        const timestamp = new Date(Number(msg.messageTimestamp) * 1000).toISOString();
 
-      // Always store chat metadata for group discovery
-      storeChatMetadata(chatJid, timestamp);
+        // Always store chat metadata for group discovery
+        storeChatMetadata(chatJid, timestamp);
 
-      // Only store full message content for registered groups
-      if (registeredGroups[chatJid]) {
-        storeMessage(msg, chatJid, msg.key.fromMe || false, msg.pushName || undefined);
+        // Only store full message content for registered groups
+        if (registeredGroups[chatJid]) {
+          let transcribedContent: string | undefined;
+
+          // Check for audio/voice message and transcribe
+          const audioMsg = msg.message.audioMessage;
+          if (audioMsg && groq) {
+            try {
+              logger.info({ chatJid, ptt: audioMsg.ptt }, 'Received audio message, transcribing...');
+              const buffer = await downloadMediaMessage(msg, 'buffer', {}) as Buffer;
+              const text = await transcribeAudio(buffer);
+              if (text) {
+                transcribedContent = `[Voice message]: ${text}`;
+              }
+            } catch (err) {
+              logger.error({ err }, 'Failed to download/transcribe audio');
+            }
+          }
+
+          storeMessage(msg, chatJid, msg.key.fromMe || false, msg.pushName || undefined, transcribedContent);
+        }
       }
-    }
+    })();
   });
 }
 

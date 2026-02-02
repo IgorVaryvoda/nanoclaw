@@ -143,11 +143,12 @@ export function setLastGroupSync(): void {
 /**
  * Store a message with full content.
  * Only call this for registered groups where message history is needed.
+ * @param contentOverride - Optional override for message content (e.g., transcribed audio)
  */
-export function storeMessage(msg: proto.IWebMessageInfo, chatJid: string, isFromMe: boolean, pushName?: string): void {
+export function storeMessage(msg: proto.IWebMessageInfo, chatJid: string, isFromMe: boolean, pushName?: string, contentOverride?: string): void {
   if (!msg.key) return;
 
-  const content =
+  const content = contentOverride ||
     msg.message?.conversation ||
     msg.message?.extendedTextMessage?.text ||
     msg.message?.imageMessage?.caption ||
