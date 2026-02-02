@@ -1,6 +1,6 @@
 /**
  * Container Runner for NanoClaw
- * Spawns agent execution in Apple Container and handles IPC
+ * Spawns agent execution in Docker or Apple Container and handles IPC
  */
 
 import { spawn } from 'child_process';
@@ -156,15 +156,43 @@ function buildVolumeMounts(group: RegisteredGroup, isMain: boolean): VolumeMount
   return mounts;
 }
 
+// Detect which container runtime to use
+function getContainerRuntime(): 'docker' | 'container' {
+  // Check if we're on Linux (use Docker) or macOS with Apple Container
+  if (process.platform === 'linux') {
+    return 'docker';
+  }
+  // On macOS, prefer Apple Container if available
+  try {
+    const { execFileSync } = require('child_process');
+    execFileSync('which', ['container'], { stdio: 'ignore' });
+    return 'container';
+  } catch {
+    return 'docker';
+  }
+}
+
 function buildContainerArgs(mounts: VolumeMount[]): string[] {
+  const runtime = getContainerRuntime();
   const args: string[] = ['run', '-i', '--rm'];
 
-  // Apple Container: --mount for readonly, -v for read-write
-  for (const mount of mounts) {
-    if (mount.readonly) {
-      args.push('--mount', `type=bind,source=${mount.hostPath},target=${mount.containerPath},readonly`);
-    } else {
-      args.push('-v', `${mount.hostPath}:${mount.containerPath}`);
+  if (runtime === 'docker') {
+    // Docker: use -v with :ro suffix for readonly
+    for (const mount of mounts) {
+      if (mount.readonly) {
+        args.push('-v', `${mount.hostPath}:${mount.containerPath}:ro`);
+      } else {
+        args.push('-v', `${mount.hostPath}:${mount.containerPath}`);
+      }
+    }
+  } else {
+    // Apple Container: --mount for readonly, -v for read-write
+    for (const mount of mounts) {
+      if (mount.readonly) {
+        args.push('--mount', `type=bind,source=${mount.hostPath},target=${mount.containerPath},readonly`);
+      } else {
+        args.push('-v', `${mount.hostPath}:${mount.containerPath}`);
+      }
     }
   }
 
@@ -201,7 +229,8 @@ export async function runContainerAgent(
   fs.mkdirSync(logsDir, { recursive: true });
 
   return new Promise((resolve) => {
-    const container = spawn('container', containerArgs, {
+    const runtime = getContainerRuntime();
+    const container = spawn(runtime, containerArgs, {
       stdio: ['pipe', 'pipe', 'pipe']
     });
 

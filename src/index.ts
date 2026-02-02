@@ -575,6 +575,26 @@ async function startMessageLoop(): Promise<void> {
 }
 
 function ensureContainerSystemRunning(): void {
+  // On Linux, use Docker (no system start needed)
+  if (process.platform === 'linux') {
+    try {
+      execSync('docker info', { stdio: 'pipe' });
+      logger.debug('Docker is running');
+      return;
+    } catch {
+      console.error('\n╔════════════════════════════════════════════════════════════════╗');
+      console.error('║  FATAL: Docker is not running                                  ║');
+      console.error('║                                                                ║');
+      console.error('║  Agents cannot run without Docker. To fix:                    ║');
+      console.error('║  1. Start Docker: sudo systemctl start docker                 ║');
+      console.error('║  2. Or install Docker if not installed                        ║');
+      console.error('║  3. Restart NanoClaw                                          ║');
+      console.error('╚════════════════════════════════════════════════════════════════╝\n');
+      throw new Error('Docker is required but not running');
+    }
+  }
+
+  // On macOS, try Apple Container first
   try {
     execSync('container system status', { stdio: 'pipe' });
     logger.debug('Apple Container system already running');
