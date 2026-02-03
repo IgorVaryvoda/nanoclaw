@@ -16,7 +16,7 @@ import {
   TIMEZONE
 } from './config.js';
 import { RegisteredGroup, Session, NewMessage } from './types.js';
-import { initDatabase, storeGenericMessage, storeChatMetadata, getNewMessages, getMessagesSince, getAllTasks, getTaskById, getAllChats } from './db.js';
+import { initDatabase, storeGenericMessage, storeChatMetadata, getNewMessages, getMessagesSince, getAllTasks, getAllChats } from './db.js';
 import { startSchedulerLoop } from './task-scheduler.js';
 import { runContainerAgent, writeTasksSnapshot, writeGroupsSnapshot, AvailableGroup } from './container-runner.js';
 import { loadJson, saveJson } from './utils.js';
@@ -219,7 +219,6 @@ async function sendMessage(jid: string, text: string): Promise<void> {
   }
 }
 
-
 async function sendMedia(jid: string, filePath: string, mediaType: string, caption?: string): Promise<void> {
   const chatId = telegramChatIds.get(jid);
   if (!chatId || !telegramBot) {
@@ -227,21 +226,15 @@ async function sendMedia(jid: string, filePath: string, mediaType: string, capti
     return;
   }
 
+  const source = { source: filePath };
+  const sendMethod = {
+    video: () => telegramBot.telegram.sendVideo(chatId, source, { caption }),
+    audio: () => telegramBot.telegram.sendAudio(chatId, source, { caption }),
+    image: () => telegramBot.telegram.sendPhoto(chatId, source, { caption }),
+  }[mediaType] ?? (() => telegramBot.telegram.sendDocument(chatId, source, { caption }));
+
   try {
-    const source = { source: filePath };
-    switch (mediaType) {
-      case 'video':
-        await telegramBot.telegram.sendVideo(chatId, source, { caption });
-        break;
-      case 'audio':
-        await telegramBot.telegram.sendAudio(chatId, source, { caption });
-        break;
-      case 'image':
-        await telegramBot.telegram.sendPhoto(chatId, source, { caption });
-        break;
-      default:
-        await telegramBot.telegram.sendDocument(chatId, source, { caption });
-    }
+    await sendMethod();
     logger.info({ chatId, mediaType, filePath }, 'Telegram media sent');
   } catch (err) {
     logger.error({ chatId, filePath, err }, 'Failed to send Telegram media');
@@ -252,27 +245,71 @@ function translateContainerPath(containerPath: string, groupFolder: string): str
   // Translate container paths to host paths
   // /workspace/group/... -> groups/{groupFolder}/...
   // /workspace/project/... -> {projectRoot}/...
-  // /workspace/extra/... -> from additional mounts (not supported yet)
 
   const projectRoot = process.cwd();
+  let basePath: string;
+  let relativePath: string;
 
   if (containerPath.startsWith('/workspace/group/')) {
-    return path.join(projectRoot, 'groups', groupFolder, containerPath.slice('/workspace/group/'.length));
+    basePath = path.join(projectRoot, 'groups', groupFolder);
+    relativePath = containerPath.slice('/workspace/group/'.length);
   } else if (containerPath.startsWith('/workspace/project/')) {
-    return path.join(projectRoot, containerPath.slice('/workspace/project/'.length));
+    basePath = projectRoot;
+    relativePath = containerPath.slice('/workspace/project/'.length);
+  } else {
+    // Unknown prefix - reject to prevent path injection
+    throw new Error(`Invalid container path prefix: ${containerPath}`);
   }
 
-  // If no translation needed, return as-is (might be an absolute host path)
-  return containerPath;
+  const resolved = path.resolve(basePath, relativePath);
+
+  // Prevent path traversal - resolved path must stay within basePath
+  if (!resolved.startsWith(basePath + path.sep) && resolved !== basePath) {
+    throw new Error(`Path traversal detected: ${containerPath}`);
+  }
+
+  return resolved;
 }
 
+
+const MAX_IPC_FILE_SIZE = 1024 * 1024; // 1MB limit for IPC files
+
+async function processIpcDirectory(
+  dir: string,
+  sourceGroup: string,
+  ipcBaseDir: string,
+  processor: (data: Record<string, unknown>) => Promise<void>,
+  logType: string
+): Promise<void> {
+  if (!fs.existsSync(dir)) return;
+
+  const files = fs.readdirSync(dir).filter(f => f.endsWith('.json'));
+  for (const file of files) {
+    const filePath = path.join(dir, file);
+    try {
+      // Check file size before reading to prevent memory exhaustion
+      const stats = fs.statSync(filePath);
+      if (stats.size > MAX_IPC_FILE_SIZE) {
+        throw new Error(`IPC file too large: ${stats.size} bytes (max ${MAX_IPC_FILE_SIZE})`);
+      }
+
+      const data = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
+      await processor(data);
+      fs.unlinkSync(filePath);
+    } catch (err) {
+      logger.error({ file, sourceGroup, err }, `Error processing IPC ${logType}`);
+      const errorDir = path.join(ipcBaseDir, 'errors');
+      fs.mkdirSync(errorDir, { recursive: true });
+      fs.renameSync(filePath, path.join(errorDir, `${sourceGroup}-${file}`));
+    }
+  }
+}
 
 function startIpcWatcher(): void {
   const ipcBaseDir = path.join(DATA_DIR, 'ipc');
   fs.mkdirSync(ipcBaseDir, { recursive: true });
 
   const processIpcFiles = async () => {
-    // Scan all group IPC directories (identity determined by directory)
     let groupFolders: string[];
     try {
       groupFolders = fs.readdirSync(ipcBaseDir).filter(f => {
@@ -290,70 +327,31 @@ function startIpcWatcher(): void {
       const messagesDir = path.join(ipcBaseDir, sourceGroup, 'messages');
       const tasksDir = path.join(ipcBaseDir, sourceGroup, 'tasks');
 
-      // Process messages from this group's IPC directory
-      try {
-        if (fs.existsSync(messagesDir)) {
-          const messageFiles = fs.readdirSync(messagesDir).filter(f => f.endsWith('.json'));
-          for (const file of messageFiles) {
-            const filePath = path.join(messagesDir, file);
-            try {
-              const data = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
-              // Authorization: verify this group can send to this chatJid
-              const targetGroup = registeredGroups[data.chatJid];
-              const isAuthorized = isMain || (targetGroup && targetGroup.folder === sourceGroup);
+      await processIpcDirectory(messagesDir, sourceGroup, ipcBaseDir, async (data) => {
+        const targetGroup = registeredGroups[data.chatJid as string];
+        const isAuthorized = isMain || (targetGroup && targetGroup.folder === sourceGroup);
 
-              if (data.type === 'message' && data.chatJid && data.text) {
-                if (isAuthorized) {
-                  await sendMessage(data.chatJid, `${ASSISTANT_NAME}: ${data.text}`);
-                  logger.info({ chatJid: data.chatJid, sourceGroup }, 'IPC message sent');
-                } else {
-                  logger.warn({ chatJid: data.chatJid, sourceGroup }, 'Unauthorized IPC message attempt blocked');
-                }
-              } else if (data.type === 'media' && data.chatJid && data.filePath && data.mediaType) {
-                if (isAuthorized) {
-                  // Translate container path to host path
-                  const hostPath = translateContainerPath(data.filePath, data.groupFolder || sourceGroup);
-                  await sendMedia(data.chatJid, hostPath, data.mediaType, data.caption);
-                  logger.info({ chatJid: data.chatJid, sourceGroup, mediaType: data.mediaType, hostPath }, 'IPC media sent');
-                } else {
-                  logger.warn({ chatJid: data.chatJid, sourceGroup }, 'Unauthorized IPC media attempt blocked');
-                }
-              }
-              fs.unlinkSync(filePath);
-            } catch (err) {
-              logger.error({ file, sourceGroup, err }, 'Error processing IPC message');
-              const errorDir = path.join(ipcBaseDir, 'errors');
-              fs.mkdirSync(errorDir, { recursive: true });
-              fs.renameSync(filePath, path.join(errorDir, `${sourceGroup}-${file}`));
-            }
+        if (data.type === 'message' && data.chatJid && data.text) {
+          if (isAuthorized) {
+            await sendMessage(data.chatJid as string, `${ASSISTANT_NAME}: ${data.text}`);
+            logger.info({ chatJid: data.chatJid, sourceGroup }, 'IPC message sent');
+          } else {
+            logger.warn({ chatJid: data.chatJid, sourceGroup }, 'Unauthorized IPC message attempt blocked');
+          }
+        } else if (data.type === 'media' && data.chatJid && data.filePath && data.mediaType) {
+          if (isAuthorized) {
+            const hostPath = translateContainerPath(data.filePath as string, (data.groupFolder as string) || sourceGroup);
+            await sendMedia(data.chatJid as string, hostPath, data.mediaType as string, data.caption as string | undefined);
+            logger.info({ chatJid: data.chatJid, sourceGroup, mediaType: data.mediaType, hostPath }, 'IPC media sent');
+          } else {
+            logger.warn({ chatJid: data.chatJid, sourceGroup }, 'Unauthorized IPC media attempt blocked');
           }
         }
-      } catch (err) {
-        logger.error({ err, sourceGroup }, 'Error reading IPC messages directory');
-      }
+      }, 'message');
 
-      // Process tasks from this group's IPC directory
-      try {
-        if (fs.existsSync(tasksDir)) {
-          const taskFiles = fs.readdirSync(tasksDir).filter(f => f.endsWith('.json'));
-          for (const file of taskFiles) {
-            const filePath = path.join(tasksDir, file);
-            try {
-              const data = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
-              // Pass source group identity to processTaskIpc for authorization
-              await processTaskIpc(data, sourceGroup, isMain);
-              fs.unlinkSync(filePath);
-            } catch (err) {
-              logger.error({ file, sourceGroup, err }, 'Error processing IPC task');
-              const errorDir = path.join(ipcBaseDir, 'errors');
-              fs.mkdirSync(errorDir, { recursive: true });
-              fs.renameSync(filePath, path.join(errorDir, `${sourceGroup}-${file}`));
-            }
-          }
-        }
-      } catch (err) {
-        logger.error({ err, sourceGroup }, 'Error reading IPC tasks directory');
-      }
+      await processIpcDirectory(tasksDir, sourceGroup, ipcBaseDir, async (data) => {
+        await processTaskIpc(data as Parameters<typeof processTaskIpc>[0], sourceGroup, isMain);
+      }, 'task');
     }
 
     setTimeout(processIpcFiles, IPC_POLL_INTERVAL);
@@ -494,10 +492,8 @@ async function processTaskIpc(
       // Only main group can request a refresh
       if (isMain) {
         logger.info({ sourceGroup }, 'Group list refresh requested via IPC');
-        // Write updated snapshot immediately
         const availableGroups = getAvailableGroups();
-        const { writeGroupsSnapshot: writeGroups } = await import('./container-runner.js');
-        writeGroups(sourceGroup, true, availableGroups, new Set(Object.keys(registeredGroups)));
+        writeGroupsSnapshot(sourceGroup, true, availableGroups, new Set(Object.keys(registeredGroups)));
       } else {
         logger.warn({ sourceGroup }, 'Unauthorized refresh_groups attempt blocked');
       }
@@ -606,7 +602,7 @@ async function connectTelegram(): Promise<void> {
   }
 
   // Get the main group JID for routing
-  const mainJid = Object.entries(registeredGroups).find(([_, g]) => g.folder === MAIN_GROUP_FOLDER)?.[0];
+  const mainJid = Object.entries(registeredGroups).find(([, g]) => g.folder === MAIN_GROUP_FOLDER)?.[0];
   if (!mainJid) {
     logger.warn('No main group registered. First message will auto-register.');
   }
@@ -727,7 +723,7 @@ async function main(): Promise<void> {
   loadState();
 
   // Restore Telegram chat ID mappings from registered groups
-  for (const [jid, _group] of Object.entries(registeredGroups)) {
+  for (const jid of Object.keys(registeredGroups)) {
     if (jid.startsWith('telegram:')) {
       const chatId = parseInt(jid.slice('telegram:'.length), 10);
       if (!isNaN(chatId)) {
