@@ -1,7 +1,6 @@
 import Database from 'better-sqlite3';
 import fs from 'fs';
 import path from 'path';
-import { proto } from '@whiskeysockets/baileys';
 import { NewMessage, ScheduledTask, TaskRunLog } from './types.js';
 import { STORE_DIR } from './config.js';
 
@@ -94,18 +93,6 @@ export function storeChatMetadata(chatJid: string, timestamp: string, name?: str
   }
 }
 
-/**
- * Update chat name without changing timestamp for existing chats.
- * New chats get the current time as their initial timestamp.
- * Used during group metadata sync.
- */
-export function updateChatName(chatJid: string, name: string): void {
-  db.prepare(`
-    INSERT INTO chats (jid, name, last_message_time) VALUES (?, ?, ?)
-    ON CONFLICT(jid) DO UPDATE SET name = excluded.name
-  `).run(chatJid, name, new Date().toISOString());
-}
-
 export interface ChatInfo {
   jid: string;
   name: string;
@@ -121,47 +108,6 @@ export function getAllChats(): ChatInfo[] {
     FROM chats
     ORDER BY last_message_time DESC
   `).all() as ChatInfo[];
-}
-
-/**
- * Get timestamp of last group metadata sync.
- */
-export function getLastGroupSync(): string | null {
-  // Store sync time in a special chat entry
-  const row = db.prepare(`SELECT last_message_time FROM chats WHERE jid = '__group_sync__'`).get() as { last_message_time: string } | undefined;
-  return row?.last_message_time || null;
-}
-
-/**
- * Record that group metadata was synced.
- */
-export function setLastGroupSync(): void {
-  const now = new Date().toISOString();
-  db.prepare(`INSERT OR REPLACE INTO chats (jid, name, last_message_time) VALUES ('__group_sync__', '__group_sync__', ?)`).run(now);
-}
-
-/**
- * Store a message with full content.
- * Only call this for registered groups where message history is needed.
- * @param contentOverride - Optional override for message content (e.g., transcribed audio)
- */
-export function storeMessage(msg: proto.IWebMessageInfo, chatJid: string, isFromMe: boolean, pushName?: string, contentOverride?: string): void {
-  if (!msg.key) return;
-
-  const content = contentOverride ||
-    msg.message?.conversation ||
-    msg.message?.extendedTextMessage?.text ||
-    msg.message?.imageMessage?.caption ||
-    msg.message?.videoMessage?.caption ||
-    '';
-
-  const timestamp = new Date(Number(msg.messageTimestamp) * 1000).toISOString();
-  const sender = msg.key.participant || msg.key.remoteJid || '';
-  const senderName = pushName || sender.split('@')[0];
-  const msgId = msg.key.id || '';
-
-  db.prepare(`INSERT OR REPLACE INTO messages (id, chat_jid, sender, sender_name, content, timestamp, is_from_me) VALUES (?, ?, ?, ?, ?, ?, ?)`)
-    .run(msgId, chatJid, sender, senderName, content, timestamp, isFromMe ? 1 : 0);
 }
 
 /**

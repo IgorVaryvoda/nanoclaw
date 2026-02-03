@@ -1,23 +1,14 @@
-import makeWASocket, {
-  useMultiFileAuthState,
-  DisconnectReason,
-  makeCacheableSignalKeyStore,
-  WASocket,
-  downloadMediaMessage,
-  proto
-} from '@whiskeysockets/baileys';
 import { Telegraf, Context } from 'telegraf';
 import { message } from 'telegraf/filters';
 import Groq from 'groq-sdk';
 import pino from 'pino';
-import { exec, execSync } from 'child_process';
+import { execSync } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 
 import {
   ASSISTANT_NAME,
   POLL_INTERVAL,
-  STORE_DIR,
   DATA_DIR,
   TRIGGER_PATTERN,
   MAIN_GROUP_FOLDER,
@@ -25,27 +16,23 @@ import {
   TIMEZONE
 } from './config.js';
 import { RegisteredGroup, Session, NewMessage } from './types.js';
-import { initDatabase, storeMessage, storeGenericMessage, storeChatMetadata, getNewMessages, getMessagesSince, getAllTasks, getTaskById, updateChatName, getAllChats, getLastGroupSync, setLastGroupSync } from './db.js';
+import { initDatabase, storeGenericMessage, storeChatMetadata, getNewMessages, getMessagesSince, getAllTasks, getTaskById, getAllChats } from './db.js';
 import { startSchedulerLoop } from './task-scheduler.js';
 import { runContainerAgent, writeTasksSnapshot, writeGroupsSnapshot, AvailableGroup } from './container-runner.js';
 import { loadJson, saveJson } from './utils.js';
-
-const GROUP_SYNC_INTERVAL_MS = 24 * 60 * 60 * 1000; // 24 hours
 
 const logger = pino({
   level: process.env.LOG_LEVEL || 'info',
   transport: { target: 'pino-pretty', options: { colorize: true } }
 });
 
-// Telegram bot
+// Telegram bot (required)
 const telegramBot = process.env.TELEGRAM_BOT_TOKEN
   ? new Telegraf(process.env.TELEGRAM_BOT_TOKEN)
   : null;
 
-// Track which JID should respond via Telegram (for bridged mode)
-// When a Telegram message comes in, we set jid -> telegramChatId
-// After responding, we clear it so next WhatsApp message goes to WhatsApp
-const telegramBridgedChats: Map<string, number> = new Map();
+// Map JID -> Telegram chat ID for routing responses
+const telegramChatIds: Map<string, number> = new Map();
 
 // Groq client for voice transcription
 const groq = process.env.GROQ_API_KEY ? new Groq({ apiKey: process.env.GROQ_API_KEY }) : null;
@@ -72,17 +59,17 @@ async function transcribeAudio(buffer: Buffer): Promise<string | null> {
   }
 }
 
-let sock: WASocket;
 let lastTimestamp = '';
 let sessions: Session = {};
 let registeredGroups: Record<string, RegisteredGroup> = {};
 let lastAgentTimestamp: Record<string, string> = {};
 
-async function setTyping(jid: string, isTyping: boolean): Promise<void> {
+async function setTypingIndicator(chatId: number): Promise<void> {
+  if (!telegramBot) return;
   try {
-    await sock.sendPresenceUpdate(isTyping ? 'composing' : 'paused', jid);
+    await telegramBot.telegram.sendChatAction(chatId, 'typing');
   } catch (err) {
-    logger.debug({ jid, err }, 'Failed to update typing status');
+    logger.debug({ chatId, err }, 'Failed to send typing indicator');
   }
 }
 
@@ -113,58 +100,20 @@ function registerGroup(jid: string, group: RegisteredGroup): void {
 }
 
 /**
- * Sync group metadata from WhatsApp.
- * Fetches all participating groups and stores their names in the database.
- * Called on startup, daily, and on-demand via IPC.
- */
-async function syncGroupMetadata(force = false): Promise<void> {
-  // Check if we need to sync (skip if synced recently, unless forced)
-  if (!force) {
-    const lastSync = getLastGroupSync();
-    if (lastSync) {
-      const lastSyncTime = new Date(lastSync).getTime();
-      const now = Date.now();
-      if (now - lastSyncTime < GROUP_SYNC_INTERVAL_MS) {
-        logger.debug({ lastSync }, 'Skipping group sync - synced recently');
-        return;
-      }
-    }
-  }
-
-  try {
-    logger.info('Syncing group metadata from WhatsApp...');
-    const groups = await sock.groupFetchAllParticipating();
-
-    let count = 0;
-    for (const [jid, metadata] of Object.entries(groups)) {
-      if (metadata.subject) {
-        updateChatName(jid, metadata.subject);
-        count++;
-      }
-    }
-
-    setLastGroupSync();
-    logger.info({ count }, 'Group metadata synced');
-  } catch (err) {
-    logger.error({ err }, 'Failed to sync group metadata');
-  }
-}
-
-/**
  * Get available groups list for the agent.
- * Returns groups ordered by most recent activity.
+ * Returns registered groups ordered by most recent activity.
  */
 function getAvailableGroups(): AvailableGroup[] {
   const chats = getAllChats();
   const registeredJids = new Set(Object.keys(registeredGroups));
 
   return chats
-    .filter(c => c.jid !== '__group_sync__' && c.jid.endsWith('@g.us'))
+    .filter(c => registeredJids.has(c.jid))
     .map(c => ({
       jid: c.jid,
       name: c.name,
       lastActivity: c.last_message_time,
-      isRegistered: registeredJids.has(c.jid)
+      isRegistered: true
     }));
 }
 
@@ -197,9 +146,11 @@ async function processMessage(msg: NewMessage): Promise<void> {
 
   logger.info({ group: group.name, messageCount: missedMessages.length }, 'Processing message');
 
-  await setTyping(msg.chat_jid, true);
+  // Send typing indicator to Telegram
+  const chatId = telegramChatIds.get(msg.chat_jid);
+  if (chatId) await setTypingIndicator(chatId);
+
   const response = await runAgent(group, prompt, msg.chat_jid);
-  await setTyping(msg.chat_jid, false);
 
   if (response) {
     lastAgentTimestamp[msg.chat_jid] = msg.timestamp;
@@ -254,28 +205,12 @@ async function runAgent(group: RegisteredGroup, prompt: string, chatJid: string)
 }
 
 async function sendMessage(jid: string, text: string): Promise<void> {
-  // Check if this JID has a Telegram response channel
-  const telegramChatId = telegramBridgedChats.get(jid);
-  if (telegramChatId && telegramBot) {
-    try {
-      await telegramBot.telegram.sendMessage(telegramChatId, text);
-      logger.info({ telegramChatId, length: text.length }, 'Telegram message sent');
-      return;
-    } catch (err) {
-      logger.error({ telegramChatId, err }, 'Failed to send Telegram message, falling back to WhatsApp');
-    }
+  const chatId = telegramChatIds.get(jid);
+  if (!chatId || !telegramBot) {
+    logger.warn({ jid }, 'No Telegram chat ID found for JID, cannot send message');
+    return;
   }
 
-  try {
-    await sock.sendMessage(jid, { text });
-    logger.info({ jid, length: text.length }, 'WhatsApp message sent');
-  } catch (err) {
-    logger.error({ jid, err }, 'Failed to send message');
-  }
-}
-
-async function sendTelegramMessage(chatId: number, text: string): Promise<void> {
-  if (!telegramBot) return;
   try {
     await telegramBot.telegram.sendMessage(chatId, text);
     logger.info({ chatId, length: text.length }, 'Telegram message sent');
@@ -284,8 +219,14 @@ async function sendTelegramMessage(chatId: number, text: string): Promise<void> 
   }
 }
 
-async function sendTelegramMedia(chatId: number, filePath: string, mediaType: string, caption?: string): Promise<void> {
-  if (!telegramBot) return;
+
+async function sendMedia(jid: string, filePath: string, mediaType: string, caption?: string): Promise<void> {
+  const chatId = telegramChatIds.get(jid);
+  if (!chatId || !telegramBot) {
+    logger.warn({ jid }, 'No Telegram chat ID found for JID, cannot send media');
+    return;
+  }
+
   try {
     const source = { source: filePath };
     switch (mediaType) {
@@ -301,37 +242,9 @@ async function sendTelegramMedia(chatId: number, filePath: string, mediaType: st
       default:
         await telegramBot.telegram.sendDocument(chatId, source, { caption });
     }
-    logger.info({ chatId, mediaType }, 'Telegram media sent');
+    logger.info({ chatId, mediaType, filePath }, 'Telegram media sent');
   } catch (err) {
     logger.error({ chatId, filePath, err }, 'Failed to send Telegram media');
-  }
-}
-
-async function sendMedia(jid: string, filePath: string, mediaType: string, caption?: string): Promise<void> {
-  try {
-    const buffer = fs.readFileSync(filePath);
-    const filename = path.basename(filePath);
-    const mimetype = getMimeType(filePath, mediaType);
-
-    switch (mediaType) {
-      case 'video':
-        await sock.sendMessage(jid, { video: buffer, caption, mimetype, fileName: filename });
-        break;
-      case 'audio':
-        await sock.sendMessage(jid, { audio: buffer, mimetype, fileName: filename });
-        break;
-      case 'image':
-        await sock.sendMessage(jid, { image: buffer, caption, mimetype, fileName: filename });
-        break;
-      case 'document':
-      default:
-        await sock.sendMessage(jid, { document: buffer, caption, mimetype, fileName: filename });
-        break;
-    }
-
-    logger.info({ jid, mediaType, filename }, 'Media sent');
-  } catch (err) {
-    logger.error({ jid, filePath, err }, 'Failed to send media');
   }
 }
 
@@ -353,28 +266,6 @@ function translateContainerPath(containerPath: string, groupFolder: string): str
   return containerPath;
 }
 
-function getMimeType(filePath: string, mediaType: string): string {
-  const ext = path.extname(filePath).toLowerCase();
-  const mimeTypes: Record<string, string> = {
-    '.mp4': 'video/mp4',
-    '.webm': 'video/webm',
-    '.mov': 'video/quicktime',
-    '.avi': 'video/x-msvideo',
-    '.mp3': 'audio/mpeg',
-    '.ogg': 'audio/ogg',
-    '.wav': 'audio/wav',
-    '.m4a': 'audio/mp4',
-    '.jpg': 'image/jpeg',
-    '.jpeg': 'image/jpeg',
-    '.png': 'image/png',
-    '.gif': 'image/gif',
-    '.webp': 'image/webp',
-    '.pdf': 'application/pdf',
-    '.doc': 'application/msword',
-    '.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-  };
-  return mimeTypes[ext] || (mediaType === 'video' ? 'video/mp4' : mediaType === 'audio' ? 'audio/mpeg' : 'application/octet-stream');
-}
 
 function startIpcWatcher(): void {
   const ipcBaseDir = path.join(DATA_DIR, 'ipc');
@@ -602,8 +493,7 @@ async function processTaskIpc(
     case 'refresh_groups':
       // Only main group can request a refresh
       if (isMain) {
-        logger.info({ sourceGroup }, 'Group metadata refresh requested via IPC');
-        await syncGroupMetadata(true);
+        logger.info({ sourceGroup }, 'Group list refresh requested via IPC');
         // Write updated snapshot immediately
         const availableGroups = getAvailableGroups();
         const { writeGroupsSnapshot: writeGroups } = await import('./container-runner.js');
@@ -635,99 +525,6 @@ async function processTaskIpc(
     default:
       logger.warn({ type: data.type }, 'Unknown IPC task type');
   }
-}
-
-async function connectWhatsApp(): Promise<void> {
-  const authDir = path.join(STORE_DIR, 'auth');
-  fs.mkdirSync(authDir, { recursive: true });
-
-  const { state, saveCreds } = await useMultiFileAuthState(authDir);
-
-  sock = makeWASocket({
-    auth: { creds: state.creds, keys: makeCacheableSignalKeyStore(state.keys, logger) },
-    printQRInTerminal: false,
-    logger,
-    browser: ['NanoClaw', 'Chrome', '1.0.0']
-  });
-
-  sock.ev.on('connection.update', (update) => {
-    const { connection, lastDisconnect, qr } = update;
-
-    if (qr) {
-      const msg = 'WhatsApp authentication required. Run /setup in Claude Code.';
-      logger.error(msg);
-      exec(`osascript -e 'display notification "${msg}" with title "NanoClaw" sound name "Basso"'`);
-      setTimeout(() => process.exit(1), 1000);
-    }
-
-    if (connection === 'close') {
-      const reason = (lastDisconnect?.error as any)?.output?.statusCode;
-      const shouldReconnect = reason !== DisconnectReason.loggedOut;
-      logger.info({ reason, shouldReconnect }, 'Connection closed');
-
-      if (shouldReconnect) {
-        logger.info('Reconnecting...');
-        connectWhatsApp();
-      } else {
-        logger.info('Logged out. Run /setup to re-authenticate.');
-        process.exit(0);
-      }
-    } else if (connection === 'open') {
-      logger.info('Connected to WhatsApp');
-      // Sync group metadata on startup (respects 24h cache)
-      syncGroupMetadata().catch(err => logger.error({ err }, 'Initial group sync failed'));
-      // Set up daily sync timer
-      setInterval(() => {
-        syncGroupMetadata().catch(err => logger.error({ err }, 'Periodic group sync failed'));
-      }, GROUP_SYNC_INTERVAL_MS);
-      startSchedulerLoop({
-        sendMessage,
-        registeredGroups: () => registeredGroups,
-        getSessions: () => sessions
-      });
-      startIpcWatcher();
-      startMessageLoop();
-    }
-  });
-
-  sock.ev.on('creds.update', saveCreds);
-
-  sock.ev.on('messages.upsert', ({ messages }) => {
-    (async () => {
-      for (const msg of messages) {
-        if (!msg.message) continue;
-        const chatJid = msg.key.remoteJid;
-        if (!chatJid || chatJid === 'status@broadcast') continue;
-
-        const timestamp = new Date(Number(msg.messageTimestamp) * 1000).toISOString();
-
-        // Always store chat metadata for group discovery
-        storeChatMetadata(chatJid, timestamp);
-
-        // Only store full message content for registered groups
-        if (registeredGroups[chatJid]) {
-          let transcribedContent: string | undefined;
-
-          // Check for audio/voice message and transcribe
-          const audioMsg = msg.message.audioMessage;
-          if (audioMsg && groq) {
-            try {
-              logger.info({ chatJid, ptt: audioMsg.ptt }, 'Received audio message, transcribing...');
-              const buffer = await downloadMediaMessage(msg, 'buffer', {}) as Buffer;
-              const text = await transcribeAudio(buffer);
-              if (text) {
-                transcribedContent = `[Voice message]: ${text}`;
-              }
-            } catch (err) {
-              logger.error({ err }, 'Failed to download/transcribe audio');
-            }
-          }
-
-          storeMessage(msg, chatJid, msg.key.fromMe || false, msg.pushName || undefined, transcribedContent);
-        }
-      }
-    })();
-  });
 }
 
 async function startMessageLoop(): Promise<void> {
@@ -804,15 +601,14 @@ function ensureContainerSystemRunning(): void {
 
 async function connectTelegram(): Promise<void> {
   if (!telegramBot) {
-    logger.info('Telegram bot not configured (TELEGRAM_BOT_TOKEN not set)');
-    return;
+    logger.error('TELEGRAM_BOT_TOKEN not set - cannot start');
+    process.exit(1);
   }
 
-  // Get the main group JID for bridging
+  // Get the main group JID for routing
   const mainJid = Object.entries(registeredGroups).find(([_, g]) => g.folder === MAIN_GROUP_FOLDER)?.[0];
   if (!mainJid) {
-    logger.warn('No main group registered, Telegram messages will not be processed');
-    return;
+    logger.warn('No main group registered. First message will auto-register.');
   }
 
   // Handle text messages
@@ -829,21 +625,35 @@ async function connectTelegram(): Promise<void> {
       return; // Ignore messages without trigger in group chats
     }
 
+    // Use virtual JID for this Telegram chat
+    const jid = `telegram:${chatId}`;
+
+    // Auto-register main group on first message if not registered
+    if (!registeredGroups[jid] && isPrivateChat) {
+      const chatName = ctx.message.chat.type === 'private'
+        ? `${userName}'s Chat`
+        : (ctx.message.chat as any).title || 'Telegram Chat';
+      registerGroup(jid, {
+        name: chatName,
+        folder: MAIN_GROUP_FOLDER,
+        trigger: ASSISTANT_NAME,
+        added_at: new Date().toISOString()
+      });
+      logger.info({ jid, chatName }, 'Auto-registered Telegram chat as main group');
+    }
+
+    if (!registeredGroups[jid]) {
+      return; // Not a registered chat
+    }
+
     logger.info({ chatId, userName, text: text.slice(0, 50) }, 'Telegram message received');
 
-    // Store message with main JID for bridging
-    storeGenericMessage(msgId, mainJid, `telegram:${userId}`, userName, text, false);
-    storeChatMetadata(mainJid, new Date().toISOString());
+    // Store chat metadata first (foreign key), then message
+    storeChatMetadata(jid, new Date().toISOString());
+    storeGenericMessage(msgId, jid, `telegram:${userId}`, userName, text, false);
 
-    // Set response channel to Telegram for this interaction
-    telegramBridgedChats.set(mainJid, chatId);
-
-    // Clear the bridge after a timeout (so WhatsApp messages go back to WhatsApp)
-    setTimeout(() => {
-      if (telegramBridgedChats.get(mainJid) === chatId) {
-        telegramBridgedChats.delete(mainJid);
-      }
-    }, 60000); // 60 second window
+    // Map JID to chat ID for responses
+    telegramChatIds.set(jid, chatId);
   });
 
   // Handle voice messages
@@ -852,6 +662,11 @@ async function connectTelegram(): Promise<void> {
     const userId = ctx.message.from?.id || chatId;
     const userName = ctx.message.from?.first_name || ctx.message.from?.username || 'Telegram User';
     const msgId = `tg-${ctx.message.message_id}`;
+    const jid = `telegram:${chatId}`;
+
+    if (!registeredGroups[jid]) {
+      return; // Not a registered chat
+    }
 
     logger.info({ chatId, userName }, 'Telegram voice message received');
 
@@ -870,29 +685,39 @@ async function connectTelegram(): Promise<void> {
 
       const text = `[Voice message]: ${transcribed}`;
 
-      // Store and process like text
-      storeGenericMessage(msgId, mainJid, `telegram:${userId}`, userName, text, false);
-      storeChatMetadata(mainJid, new Date().toISOString());
+      // Store chat metadata first (foreign key), then message
+      storeChatMetadata(jid, new Date().toISOString());
+      storeGenericMessage(msgId, jid, `telegram:${userId}`, userName, text, false);
 
-      telegramBridgedChats.set(mainJid, chatId);
-      setTimeout(() => {
-        if (telegramBridgedChats.get(mainJid) === chatId) {
-          telegramBridgedChats.delete(mainJid);
-        }
-      }, 60000);
+      telegramChatIds.set(jid, chatId);
     } catch (err) {
       logger.error({ err }, 'Failed to process Telegram voice message');
       await ctx.reply('Error processing voice message');
     }
   });
 
-  // Launch bot
-  telegramBot.launch();
+  // Start scheduler, IPC watcher, and message loop
+  startSchedulerLoop({
+    sendMessage,
+    registeredGroups: () => registeredGroups,
+    getSessions: () => sessions
+  });
+  startIpcWatcher();
+
+  // Launch bot (don't await - it runs the polling loop and only resolves on stop)
+  telegramBot.launch().then(() => {
+    logger.info('Telegram bot stopped');
+  }).catch(err => {
+    logger.error({ err }, 'Telegram bot error');
+  });
   logger.info('Telegram bot connected');
 
   // Graceful shutdown
   process.once('SIGINT', () => telegramBot.stop('SIGINT'));
   process.once('SIGTERM', () => telegramBot.stop('SIGTERM'));
+
+  // Start message loop (blocking)
+  await startMessageLoop();
 }
 
 async function main(): Promise<void> {
@@ -900,8 +725,18 @@ async function main(): Promise<void> {
   initDatabase();
   logger.info('Database initialized');
   loadState();
+
+  // Restore Telegram chat ID mappings from registered groups
+  for (const [jid, _group] of Object.entries(registeredGroups)) {
+    if (jid.startsWith('telegram:')) {
+      const chatId = parseInt(jid.slice('telegram:'.length), 10);
+      if (!isNaN(chatId)) {
+        telegramChatIds.set(jid, chatId);
+      }
+    }
+  }
+
   await connectTelegram();
-  await connectWhatsApp();
 }
 
 main().catch(err => {
