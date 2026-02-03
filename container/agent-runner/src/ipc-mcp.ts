@@ -42,7 +42,7 @@ export function createIpcMcp(ctx: IpcMcpContext) {
     tools: [
       tool(
         'send_message',
-        'Send a message to the current WhatsApp group. Use this to proactively share information or updates.',
+        'Send an ADDITIONAL message to Telegram. ONLY use this for scheduled tasks or to send follow-up messages AFTER your main response. Do NOT use for your primary reply - that is sent automatically.',
         {
           text: z.string().describe('The message text to send')
         },
@@ -68,7 +68,7 @@ export function createIpcMcp(ctx: IpcMcpContext) {
 
       tool(
         'send_media',
-        'Send a media file (video, audio, image, document) to the current WhatsApp chat. The file must exist in the workspace.',
+        'Send a media file (video, audio, image, document) to the current Telegram chat. The file must exist in the workspace.',
         {
           file_path: z.string().describe('Path to the media file in the workspace (e.g., /workspace/group/video.mp4)'),
           caption: z.string().optional().describe('Optional caption for the media'),
@@ -318,14 +318,14 @@ SCHEDULE VALUE FORMAT (all times are LOCAL timezone):
 
       tool(
         'register_group',
-        `Register a new WhatsApp group so the agent can respond to messages there. Main group only.
+        `Register a new Telegram chat so the agent can respond to messages there. Main group only.
 
-Use available_groups.json to find the JID for a group. The folder name should be lowercase with hyphens (e.g., "family-chat").`,
+The folder name should be lowercase with hyphens (e.g., "family-chat").`,
         {
-          jid: z.string().describe('The WhatsApp JID (e.g., "120363336345536173@g.us")'),
-          name: z.string().describe('Display name for the group'),
-          folder: z.string().describe('Folder name for group files (lowercase, hyphens, e.g., "family-chat")'),
-          trigger: z.string().describe('Trigger word (e.g., "@Andy")')
+          jid: z.string().describe('The Telegram chat ID (e.g., "telegram:123456789")'),
+          name: z.string().describe('Display name for the chat'),
+          folder: z.string().describe('Folder name for chat files (lowercase, hyphens, e.g., "family-chat")'),
+          trigger: z.string().describe('Trigger word (e.g., "@tim")')
         },
         async (args) => {
           if (!isMain) {
