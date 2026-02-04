@@ -595,6 +595,47 @@ function ensureContainerSystemRunning(): void {
   }
 }
 
+async function launchTelegramWithRetry(bot: Telegraf<Context>): Promise<void> {
+  const maxRetries = 10;
+  const baseDelay = 1000; // 1 second
+  const maxDelay = 60000; // 1 minute cap
+
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      // Test connection with getMe before launching
+      await bot.telegram.getMe();
+
+      // Connection works, now launch the bot (non-blocking polling loop)
+      bot.launch().then(() => {
+        logger.info('Telegram bot stopped');
+      }).catch(err => {
+        logger.error({ err }, 'Telegram bot error');
+      });
+
+      logger.info('Telegram bot connected');
+      return;
+    } catch (err: any) {
+      const delay = Math.min(baseDelay * Math.pow(2, attempt - 1), maxDelay);
+      const isNetworkError = err?.code === 'EAI_AGAIN' || err?.code === 'ENOTFOUND' || err?.code === 'ETIMEDOUT';
+
+      if (attempt === maxRetries) {
+        logger.error({ err, attempt }, 'Failed to connect to Telegram after max retries');
+        throw err;
+      }
+
+      logger.warn({
+        attempt,
+        maxRetries,
+        delayMs: delay,
+        error: err?.message || String(err),
+        isNetworkError
+      }, 'Telegram connection failed, retrying...');
+
+      await new Promise(resolve => setTimeout(resolve, delay));
+    }
+  }
+}
+
 async function connectTelegram(): Promise<void> {
   if (!telegramBot) {
     logger.error('TELEGRAM_BOT_TOKEN not set - cannot start');
@@ -700,13 +741,8 @@ async function connectTelegram(): Promise<void> {
   });
   startIpcWatcher();
 
-  // Launch bot (don't await - it runs the polling loop and only resolves on stop)
-  telegramBot.launch().then(() => {
-    logger.info('Telegram bot stopped');
-  }).catch(err => {
-    logger.error({ err }, 'Telegram bot error');
-  });
-  logger.info('Telegram bot connected');
+  // Launch bot with exponential backoff retry (handles network not ready at boot)
+  await launchTelegramWithRetry(telegramBot);
 
   // Graceful shutdown
   process.once('SIGINT', () => telegramBot.stop('SIGINT'));
