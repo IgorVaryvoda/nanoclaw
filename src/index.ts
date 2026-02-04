@@ -204,6 +204,40 @@ async function runAgent(group: RegisteredGroup, prompt: string, chatJid: string)
   }
 }
 
+/**
+ * Convert Markdown to Telegram HTML format.
+ * Handles: **bold**, *italic*, `code`, ```code blocks```, [links](url)
+ */
+function markdownToTelegramHtml(text: string): string {
+  // Escape HTML entities first
+  let html = text
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+
+  // Code blocks (```lang\ncode\n```) - must be before inline code
+  html = html.replace(/```[\w]*\n?([\s\S]*?)```/g, '<pre>$1</pre>');
+
+  // Inline code (`code`)
+  html = html.replace(/`([^`]+)`/g, '<code>$1</code>');
+
+  // Bold (**text** or __text__)
+  html = html.replace(/\*\*([^*]+)\*\*/g, '<b>$1</b>');
+  html = html.replace(/__([^_]+)__/g, '<b>$1</b>');
+
+  // Italic (*text* or _text_) - but not inside words like file_name
+  html = html.replace(/(?<![\\w])\*([^*]+)\*(?![\\w])/g, '<i>$1</i>');
+  html = html.replace(/(?<![\\w])_([^_]+)_(?![\\w])/g, '<i>$1</i>');
+
+  // Strikethrough (~~text~~)
+  html = html.replace(/~~([^~]+)~~/g, '<s>$1</s>');
+
+  // Links [text](url)
+  html = html.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2">$1</a>');
+
+  return html;
+}
+
 async function sendMessage(jid: string, text: string): Promise<void> {
   const chatId = telegramChatIds.get(jid);
   if (!chatId || !telegramBot) {
@@ -212,10 +246,17 @@ async function sendMessage(jid: string, text: string): Promise<void> {
   }
 
   try {
-    await telegramBot.telegram.sendMessage(chatId, text);
+    const html = markdownToTelegramHtml(text);
+    await telegramBot.telegram.sendMessage(chatId, html, { parse_mode: 'HTML' });
     logger.info({ chatId, length: text.length }, 'Telegram message sent');
   } catch (err) {
-    logger.error({ chatId, err }, 'Failed to send Telegram message');
+    // If HTML parsing fails, fall back to plain text
+    logger.warn({ chatId, err }, 'HTML send failed, falling back to plain text');
+    try {
+      await telegramBot.telegram.sendMessage(chatId, text);
+    } catch (plainErr) {
+      logger.error({ chatId, err: plainErr }, 'Failed to send Telegram message');
+    }
   }
 }
 
@@ -227,11 +268,14 @@ async function sendMedia(jid: string, filePath: string, mediaType: string, capti
   }
 
   const source = { source: filePath };
+  const htmlCaption = caption ? markdownToTelegramHtml(caption) : undefined;
+  const opts = { caption: htmlCaption, parse_mode: 'HTML' as const };
+
   const sendMethod = {
-    video: () => telegramBot.telegram.sendVideo(chatId, source, { caption }),
-    audio: () => telegramBot.telegram.sendAudio(chatId, source, { caption }),
-    image: () => telegramBot.telegram.sendPhoto(chatId, source, { caption }),
-  }[mediaType] ?? (() => telegramBot.telegram.sendDocument(chatId, source, { caption }));
+    video: () => telegramBot.telegram.sendVideo(chatId, source, opts),
+    audio: () => telegramBot.telegram.sendAudio(chatId, source, opts),
+    image: () => telegramBot.telegram.sendPhoto(chatId, source, opts),
+  }[mediaType] ?? (() => telegramBot.telegram.sendDocument(chatId, source, opts));
 
   try {
     await sendMethod();
