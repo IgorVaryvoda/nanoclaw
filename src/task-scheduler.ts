@@ -75,6 +75,9 @@ async function runTask(task: ScheduledTask, deps: SchedulerDependencies): Promis
       error = output.error || 'Unknown error';
     } else {
       result = output.result;
+      if (result) {
+        await deps.sendMessage(task.chat_jid, result);
+      }
     }
 
     logger.info({ taskId: task.id, durationMs: Date.now() - startTime }, 'Task completed');
